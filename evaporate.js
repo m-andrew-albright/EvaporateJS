@@ -14,7 +14,7 @@
 
 /***************************************************************************************************
  *                                                                                                 *
- *  version 2.0.8                                                                                  *
+ *  version 2.1.4                                                                                  *
  *                                                                                                 *
  ***************************************************************************************************/
 
@@ -32,7 +32,6 @@
         'maxConcurrentParts',
         'logging',
         'cloudfront',
-        'aws_url',
         'encodeFilename',
         'computeContentMd5',
         'allowS3ExistenceOptimization',
@@ -40,11 +39,17 @@
         'timeUrl',
         'cryptoMd5Method',
         'cryptoHexEncodedHash256',
-        'aws_key',
         'awsRegion',
         'awsSignatureVersion',
         'evaporateChanged'
       ],
+      S3_EXTRA_ENCODED_CHARS =  {
+        33: "%21", // !
+        39: "%27", // '
+        40: "%28", // (
+        41: "%29", // )
+        42: "%2A"  // *
+      },
       l;
 
   var Evaporate = function (config) {
@@ -60,6 +65,7 @@
       progressIntervalMS: 1000,
       cloudfront: false,
       s3Acceleration: false,
+      mockLocalStorage: false,
       encodeFilename: true,
       computeContentMd5: false,
       allowS3ExistenceOptimization: false,
@@ -118,6 +124,7 @@
     this.pendingFiles = {};
     this.queuedFiles = [];
     this.filesInProcess = [];
+    historyCache = new HistoryCache(this.config.mockLocalStorage);
   };
   Evaporate.create = function (config) {
     var evapConfig = extend({}, config);
@@ -147,8 +154,9 @@
           if (xhr.readyState === 4) {
             if (xhr.status === 200) {
               var server_date = new Date(Date.parse(xhr.responseText)),
-                  now = new Date();
-              resolve(server_date - now);
+                  offset = server_date - new Date();
+              l.d('localTimeOffset is', offset, 'ms');
+              resolve(offset);
             }
           }
         };
@@ -161,13 +169,7 @@
       } else {
         resolve(0);
       }
-    })
-        .then(function (offset) {
-          l.d('localTimeOffset is', offset, 'ms');
-          return new Promise(function (resolve) {
-            resolve(offset);
-          });
-        });
+    });
   };
   Evaporate.prototype.config = {};
   Evaporate.prototype.localTimeOffset = 0;
@@ -220,7 +222,7 @@
         return reject('Missing file');
       }
       if (fileConfig.maxFileSize && file.file.size > fileConfig.maxFileSize) {
-        return reject('File size too large. Maximum size allowed is ' + fileConfig.maxFileSize);
+        return reject('File size too large. Maximum size allowed is ' + readableFileSize(fileConfig.maxFileSize));
       }
       if (typeof file.name === 'undefined') {
         return reject('Missing attribute: name');
@@ -476,7 +478,7 @@
   FileUpload.prototype.progressInterval = undefined;
   FileUpload.prototype.startTime = undefined;
   FileUpload.prototype.loaded = 0;
-  FileUpload.prototype.totalUpoaded = 0;
+  FileUpload.prototype.totalUploaded = 0;
   FileUpload.prototype.updateLoaded = function (loadedNow) {
     this.loaded += loadedNow;
     this.fileTotalBytesUploaded += loadedNow;
@@ -485,22 +487,36 @@
     // Adapted from https://github.com/fkjaekel
     // https://github.com/TTLabs/EvaporateJS/issues/13
     if (this.fileTotalBytesUploaded === 0) {
-      return {};
+      return {
+        speed: 0,
+        readableSpeed: "",
+        loaded: 0,
+        totalUploaded: 0,
+        remainingSize: this.sizeBytes,
+        secondsLeft: -1,
+        fileSize: this.sizeBytes,
+      };
     }
 
-    this.totalUpoaded += this.loaded;
+    this.totalUploaded += this.loaded;
     var delta = (new Date() - this.startTime) / 1000,
-        avgSpeed = this.totalUpoaded / delta,
+        avgSpeed = this.totalUploaded / delta,
+        remainingSize = this.sizeBytes - this.fileTotalBytesUploaded,
         stats = {
           speed: avgSpeed,
           readableSpeed: readableFileSize(avgSpeed),
-          loaded: this.loaded
-        },
-        remainingSize = this.sizeBytes - this.fileTotalBytesUploaded;
+          loaded: this.loaded,
+          totalUploaded: this.fileTotalBytesUploaded,
+          remainingSize: remainingSize,
+          secondsLeft: -1,
+          fileSize: this.sizeBytes,
+
+        };
 
     if (avgSpeed > 0) {
       stats.secondsLeft = Math.round(remainingSize / avgSpeed);
     }
+
     return stats;
   };
   FileUpload.prototype.onProgress = function () {
@@ -513,7 +529,7 @@
     clearInterval(this.progressInterval);
     this.startTime = new Date();
     this.loaded = 0;
-    this.totalUpoaded = 0;
+    this.totalUploaded = 0;
     this.onProgress();
     this.progressInterval = setInterval(this.onProgress.bind(this), this.con.progressIntervalMS);
   };
@@ -559,51 +575,32 @@
     var existenceOptimized = this.con.computeContentMd5 &&
             this.con.allowS3ExistenceOptimization &&
             typeof this.firstMd5Digest !== 'undefined' &&
-            typeof this.eTag !== 'undefined',
-        self = this,
-        callComplete = false;
+            typeof this.eTag !== 'undefined';
 
-    new Promise(function (resolve, reject) {
-
-      new Promise(function (resolve, rejectToUploadNew) {
-        if (self.uploadId) {
+        if (this.uploadId) {
           if (existenceOptimized) {
-            return self.reuseS3Object(awsKey)
-                .then(resolve, rejectToUploadNew);
+            return this.reuseS3Object(awsKey)
+                .then(this.deferredCompletion.resolve)
+                .catch(this.uploadFileFromScratch.bind(this));
           }
 
-          callComplete = true;
-          self.resumeInterruptedUpload()
-              .then(resolve, rejectToUploadNew);
+          this.resumeInterruptedUpload()
+              .then(this._uploadComplete.bind(this))
+              .catch(this.uploadFileFromScratch.bind(this));
         } else {
-          throw(""); // throw triggers the Upload here for the common case
+          this.uploadFileFromScratch("");
         }
-      })
-          .then(resolve,
-              function (reason) { // rejectToUploadNew
-                if (ACTIVE_STATUSES.indexOf(self.status) === -1) { return; }
-                l.d(reason);
-                self.uploadId = undefined;
-                callComplete = true;
-                self.uploadFile(awsKey)
-                    .then(resolve, reject);
-              });
-    })
-        .then(
-            function () {
-              var promise = callComplete ? self.completeUpload() : Promise.resolve();
-              promise.then(self.deferredCompletion.resolve.bind(self));
-            },
-            function () { // uploadFile failed
-              if (!self.abortedByUser) {
-                self.abortUpload()
-                    .then(
-                        function () { self.deferredCompletion.reject('File upload aborted due to a part failing to upload'); },
-                        self.deferredCompletion.reject.bind(self));
-              }
-            }
-        );
-
+  };
+  FileUpload.prototype.uploadFileFromScratch = function (reason) {
+    if (ACTIVE_STATUSES.indexOf(this.status) === -1) { return; }
+    l.d(reason);
+    this.uploadId = undefined;
+    return this.uploadFile(this.name)
+        .then(this._uploadComplete.bind(this))
+        .catch(this._abortUpload.bind(this));
+  };
+  FileUpload.prototype._uploadComplete = function () {
+    this.completeUpload().then(this.deferredCompletion.resolve);
   };
   FileUpload.prototype.stop = function () {
     l.d('stopping FileUpload ', this.id);
@@ -650,21 +647,31 @@
     this.partsOnS3 = [];
     this.s3Parts = [];
   };
-
-  FileUpload.prototype.startPartUpload = function (part) {
-    this.lastPartSatisfied
-        .then(part.delaySend.bind(part));
-    this.lastPartSatisfied = part.getStartedPromise();
+  FileUpload.prototype._startCompleteUpload = function (callComplete) {
+    return function () {
+      var promise = callComplete ? this.completeUpload() : Promise.resolve();
+      promise.then(this.deferredCompletion.resolve.bind(this));
+    }
   };
+  FileUpload.prototype._abortUpload = function () {
+    if (!this.abortedByUser) {
+      var self = this;
+      this.abortUpload()
+          .then(
+              function () { self.deferredCompletion.reject('File upload aborted due to a part failing to upload'); },
+              this.deferredCompletion.reject.bind(this));
+    }
+  };
+
   FileUpload.prototype.abortParts = function (pause) {
     var self = this;
     var toAbort = this.partsInProcess.slice(0);
     toAbort.forEach(function (i) {
-      var part = self.s3Parts[i];
-      if (part) {
-        part.awsRequest.abort();
-        if (pause) { part.status = PENDING; }
-        removeAtIndex(self.partsInProcess, part.part);
+      var s3Part = self.s3Parts[i];
+      if (s3Part) {
+        s3Part.awsRequest.abort();
+        if (pause) { s3Part.status = PENDING; }
+        removeAtIndex(self.partsInProcess, s3Part.partNumber);
         if (self.partsToUpload.length) { self.evaporatingCnt(-1); }
       }
     });
@@ -676,8 +683,8 @@
     var self = this;
 
     function cleanUpAfterPart(s3Part) {
-      removeAtIndex(self.partsToUpload, s3Part.part);
-      removeAtIndex(self.partsInProcess, s3Part.part);
+      removeAtIndex(self.partsToUpload, s3Part.partNumber);
+      removeAtIndex(self.partsInProcess, s3Part.partNumber);
 
       if (self.partsToUpload.length) { self.evaporatingCnt(-1); }
     }
@@ -715,18 +722,18 @@
     return partsDeferredPromises;
   };
   FileUpload.prototype.makePart = function (partNumber, status, size) {
-    var part = {
+    var s3Part = {
       status: status,
       loadedBytes: 0,
       loadedBytesPrevious: null,
       isEmpty: (size === 0), // issue #58
       md5_digest: null,
-      part: partNumber
+      partNumber: partNumber
     };
 
-    this.s3Parts[partNumber] = part;
+    this.s3Parts[partNumber] = s3Part;
 
-    return part;
+    return s3Part;
   };
   FileUpload.prototype.setStatus = function (s) {
     this.status = s;
@@ -820,25 +827,23 @@
   };
   FileUpload.prototype.listPartsSuccess = function (listPartsRequest, partsXml) {
     this.info('uploadId', this.uploadId, 'is not complete. Fetching parts from part marker', listPartsRequest.partNumberMarker);
-    var oDOM = parseXml(partsXml),
-        listPartsResult = oDOM.getElementsByTagName("ListPartsResult")[0],
-        uploadedParts = oDOM.getElementsByTagName("Part"),
-        parts_len = uploadedParts.length,
-        cp, partSize;
+    partsXml = partsXml.replace(/(\r\n|\n|\r)/gm, ""); // strip line breaks to ease the regex requirements
+    var partRegex = /<Part>(.+?)<\/Part\>/g;
 
-    for (var i = 0; i < parts_len; i++) {
-      cp = uploadedParts[i];
-      partSize = parseInt(nodeValue(cp, "Size"), 10);
+    while (true) {
+      var cp = (partRegex.exec(partsXml) || [])[1];
+      if (!cp) { break; }
+
+      var partSize = parseInt(elementText(cp, "Size"), 10);
       this.fileTotalBytesUploaded += partSize;
       this.partsOnS3.push({
-        eTag: nodeValue(cp, "ETag"),
-        partNumber: parseInt(nodeValue(cp, "PartNumber"), 10),
+        eTag: elementText(cp, "ETag").replace(/&quot;/g, '"'),
+        partNumber: parseInt(elementText(cp, "PartNumber"), 10),
         size: partSize,
-        LastModified: nodeValue(cp, "LastModified")
+        LastModified: elementText(cp, "LastModified")
       });
     }
-
-    return listPartsResult;
+    return elementText(partsXml, "IsTruncated") === 'true' ? elementText(partsXml, "NextPartNumberMarker") : undefined;
   };
   FileUpload.prototype.makePartsfromPartsOnS3 = function () {
     if (ACTIVE_STATUSES.indexOf(this.status) === -1) { return; }
@@ -857,9 +862,7 @@
         .send()
         .then(
             function (xhr) {
-              var oDOM = parseXml(xhr.responseText),
-                  result = oDOM.getElementsByTagName("CompleteMultipartUploadResult")[0];
-              self.eTag = nodeValue(result, "ETag");
+              self.eTag = elementText(xhr.responseText, "ETag").replace(/&quot;/g, '"');
               self.completeUploadFile(xhr);
             });
   };
@@ -887,16 +890,18 @@
 
       var satisfied = 0;
       for (var i = 0; i < this.partsToUpload.length; i++) {
-        var part = this.s3Parts[this.partsToUpload[i]];
+        var s3Part = this.s3Parts[this.partsToUpload[i]];
 
-        if (part.status === EVAPORATING) { continue; }
+        if (s3Part.status === EVAPORATING) { continue; }
 
-        if (this.canStartPart(part)) {
+        if (this.canStartPart(s3Part)) {
           if (this.partsInProcess.length && this.partsToUpload.length > 1) {
             this.evaporatingCnt(+1);
           }
-          this.partsInProcess.push(part.part);
-          this.startPartUpload(part.awsRequest);
+          this.partsInProcess.push(s3Part.partNumber);
+          var awsRequest = s3Part.awsRequest;
+          this.lastPartSatisfied.then(awsRequest.delaySend.bind(awsRequest));
+          this.lastPartSatisfied = awsRequest.getStartedPromise();
         } else { continue; }
 
         satisfied += 1;
@@ -915,7 +920,7 @@
     return 0;
   };
   FileUpload.prototype.canStartPart = function (part) {
-    return this.partsInProcess.indexOf(part.part) === -1 && !part.awsRequest.errorExceptionStatus();
+    return this.partsInProcess.indexOf(part.partNumber) === -1 && !part.awsRequest.errorExceptionStatus();
   };
   FileUpload.prototype.uploadFile = function (awsKey) {
     this.removeUploadFile();
@@ -936,7 +941,7 @@
   };
   FileUpload.prototype.uploadParts = function () {
     this.loaded = 0;
-    this.totalUpoaded = 0;
+    this.totalUploaded = 0;
     if (ACTIVE_STATUSES.indexOf(this.status) === -1) {
       return Promise.reject('Part uploading stopped because the file was canceled');
     }
@@ -976,14 +981,14 @@
     // Attempt to reuse entire uploaded object on S3
     this.makeParts(1);
     this.partsToUpload = [];
-    var firstPart = this.s3Parts[1];
+    var firstS3Part = this.s3Parts[1];
     function reject(reason) {
       self.name = awsKey;
       throw(reason);
     }
-    return firstPart.awsRequest.getPartMd5Digest()
+    return firstS3Part.awsRequest.getPartMd5Digest()
         .then(function () {
-          if (self.firstMd5Digest === self.s3Parts[1].md5_digest) {
+          if (self.firstMd5Digest === firstS3Part.md5_digest) {
             return new ReuseS3Object(self, awsKey)
                 .send()
                 .then(
@@ -1013,7 +1018,12 @@
     this.awsUrl = awsUrl(this.con);
     this.awsHost = uri(this.awsUrl).hostname;
 
-    this.updateRequest(request);
+    var r = extend({}, request);
+    if (fileUpload.contentType) {
+      r.contentType = fileUpload.contentType;
+    }
+
+    this.updateRequest(r);
   }
   SignedS3AWSRequest.prototype.fileUpload = undefined;
   SignedS3AWSRequest.prototype.con = undefined;
@@ -1036,7 +1046,7 @@
     var SigningClass = signingVersion(this, l);
     this.signer = new SigningClass(request);
   };
-  SignedS3AWSRequest.prototype.success = function () { return true; };
+  SignedS3AWSRequest.prototype.success = function () { this.awsDeferred.resolve(this.currentXhr); };
   SignedS3AWSRequest.prototype.backOffWait = function () {
     return (this.attempts === 1) ? 0 : 1000 * Math.min(
             this.con.maxRetryBackoffSecs,
@@ -1112,7 +1122,7 @@
                 xhr.response.match(new RegExp(self.request.response_match)) === undefined) {
               reject('AWS response does not match set pattern: ' + self.request.response_match);
             } else {
-              resolve(xhr);
+              resolve();
             }
           } else {
             var reason = xhr.responseText ? getAwsResponse(xhr) : ' ';
@@ -1181,14 +1191,7 @@
             function (value) {
               self.authorizationSuccess(value);
               if (self.fileUpload.status === ABORTED) { return; }
-              self.sendRequestToAWS()
-                  .then(
-                      function (value) {
-                        if (self.success(value)) {
-                          self.awsDeferred.resolve(value);
-                        }
-                      },
-                      self.error.bind(self));
+              self.sendRequestToAWS().then(self.success.bind(self), self.error.bind(self));
             },
             self.error.bind(self));
   };
@@ -1240,22 +1243,18 @@
       response_match: '<UploadId>(.+)<\/UploadId>'
     };
 
-    if (fileUpload.contentType) {
-      request.contentType = fileUpload.contentType;
-    }
-
     CancelableS3AWSRequest.call(this, fileUpload, request);
     this.awsKey = awsKey;
   }
   InitiateMultipartUpload.prototype = Object.create(CancelableS3AWSRequest.prototype);
   InitiateMultipartUpload.prototype.constructor = InitiateMultipartUpload;
-  InitiateMultipartUpload.prototype.success = function (xhr) {
-    var match = xhr.response.match(new RegExp(this.request.response_match));
+  InitiateMultipartUpload.prototype.success = function () {
+    var match = this.currentXhr.response.match(new RegExp(this.request.response_match));
     this.fileUpload.uploadId = match[1];
     this.fileUpload.awsKey = this.awsKey;
     l.d('InitiateMultipartUpload ID is', this.fileUpload.uploadId);
     this.fileUpload.createUploadFile();
-    return true;
+    this.awsDeferred.resolve(this.currentXhr);
   };
 
   //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadComplete.html
@@ -1295,12 +1294,11 @@
   ReuseS3Object.prototype = Object.create(SignedS3AWSRequestWithRetryLimit.prototype);
   ReuseS3Object.prototype.constructor = ReuseS3Object;
   ReuseS3Object.prototype.awsKey = undefined;
-  ReuseS3Object.prototype.success = function (xhr) {
-    var eTag = xhr.getResponseHeader('Etag');
-    if (eTag !== this.fileUpload.eTag) {
-      return this.rejectedSuccess('uploadId ', this.fileUpload.id, ' found on S3 but the Etag doesn\'t match.');
-    }
-    return true;
+  ReuseS3Object.prototype.success = function () {
+    var eTag = this.currentXhr.getResponseHeader('Etag');
+    if (eTag !== this.fileUpload.eTag &&
+        !this.rejectedSuccess('uploadId ', this.fileUpload.id, ' found on S3 but the Etag doesn\'t match.')) { return; }
+    this.awsDeferred.resolve(this.currentXhr);
   };
 
   //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadListParts.html
@@ -1333,22 +1331,21 @@
     this.request = request;
     return request;
   };
-  ResumeInterruptedUpload.prototype.success = function (xhr) {
-    if (xhr.status === 404) {
+  ResumeInterruptedUpload.prototype.success = function () {
+    if (this.currentXhr.status === 404) {
       // Success! Upload is no longer recognized, so there is nothing to fetch
-      return this.rejectedSuccess('uploadId ', this.fileUpload.id, ' not found on S3.');
+      if (this.rejectedSuccess('uploadId ', this.fileUpload.id, ' not found on S3.')) { this.awsDeferred.resolve(this.currentXhr); }
+      return;
     }
 
-    var listPartsResult = this.fileUpload.listPartsSuccess(this, xhr.responseText);
-    var isTruncated = nodeValue(listPartsResult, "IsTruncated") === 'true';
-
-    if (isTruncated) {
-      var request = this.setupRequest(nodeValue(listPartsResult, "NextPartNumberMarker")); // let's fetch the next set of parts
+    var nextPartNumber = this.fileUpload.listPartsSuccess(this, this.currentXhr.responseText);
+    if (nextPartNumber) {
+      var request = this.setupRequest(nextPartNumber); // let's fetch the next set of parts
       this.updateRequest(request);
       this.trySend();
     } else {
       this.fileUpload.makePartsfromPartsOnS3();
-      return true;
+      this.awsDeferred.resolve(this.currentXhr);
     }
   };
 
@@ -1356,7 +1353,7 @@
   function PutPart(fileUpload, part) {
     this.part = part;
 
-    this.partNumber = part.part;
+    this.partNumber = part.partNumber;
     this.start = (this.partNumber - 1) * fileUpload.con.partSize;
     this.end = Math.min(this.partNumber * fileUpload.con.partSize, fileUpload.sizeBytes);
 
@@ -1426,10 +1423,11 @@
           });
     }
   };
-  PutPart.prototype.success = function (xhr) {
+  PutPart.prototype.success = function () {
     clearInterval(this.stalledInterval);
-    var eTag = xhr.getResponseHeader('ETag');
-    return this.fileUpload.partSuccess(eTag, this);
+    var eTag = this.currentXhr.getResponseHeader('ETag');
+    this.currentXhr = null;
+    if (this.fileUpload.partSuccess(eTag, this)) { this.awsDeferred.resolve(this.currentXhr); }
   };
   PutPart.prototype.onProgress = function (evt) {
     if (evt.loaded > 0) {
@@ -1469,16 +1467,8 @@
     return [CANCELED, ABORTED, PAUSED, PAUSING].indexOf(this.fileUpload.status) > -1;
   };
   PutPart.prototype.delaySend = function () {
-    var backOffWait;
-
-    if (this.part.status === ERROR) {
-      backOffWait = this.backOffWait();
-
-      this.attempts += 1;
-    } else {
-      backOffWait = 0;
-    }
-
+    var backOffWait = this.backOffWait();
+    this.attempts += 1;
     setTimeout(this.send.bind(this), backOffWait);
   };
   PutPart.prototype.errorHandler = function (reason) {
@@ -1508,7 +1498,7 @@
   };
   PutPart.size = 0;
   PutPart.prototype.streamToArrayBuffer = function (stream) {
-    var promise = new Promise(function (resolve, reject) {
+    return new Promise(function (resolve, reject) {
       // stream is empty or ended
       if (!stream.readable) { return resolve([]); }
 
@@ -1544,15 +1534,10 @@
         stream.removeListener('close', onClose);
       }
     }.bind(this));
-
-    return promise;
   };
   PutPart.prototype.getPayload = function () {
     if (typeof this.payloadPromise === 'undefined') {
-      this.payloadPromise = new Promise(function (resolve, reject) {
-        var promise = this.con.readableStreams ? this.payloadFromStream() : this.payloadFromBlob();
-        promise.then(resolve, reject);
-      }.bind(this));
+      this.payloadPromise = this.con.readableStreams ? this.payloadFromStream() : this.payloadFromBlob();
     }
     return this.payloadPromise;
   };
@@ -1573,15 +1558,18 @@
     var file = this.fileUpload.file,
         slicerFn = (file.slice ? 'slice' : (file.mozSlice ? 'mozSlice' : 'webkitSlice')),
         blob = file[slicerFn](this.start, this.end);
-    return new Promise(function (resolve) {
-      var reader = new FileReader();
-      reader.onloadend = function () {
-        var buffer = this.result && typeof this.result.buffer !== 'undefined',
-            result = buffer ? new Uint8Array(this.result.buffer) : this.result;
-        resolve(result);
-      };
-      reader.readAsArrayBuffer(blob);
-    });
+    if (this.con.computeContentMd5) {
+      return new Promise(function (resolve) {
+        var reader = new FileReader();
+        reader.onloadend = function () {
+          var buffer = this.result && typeof this.result.buffer !== 'undefined',
+              result = buffer ? new Uint8Array(this.result.buffer) : this.result;
+          resolve(result);
+        };
+        reader.readAsArrayBuffer(blob);
+      });
+    }
+    return Promise.resolve(blob);
   };
   PutPart.prototype.stalledInterval = -1;
   PutPart.prototype.getStartedPromise = function () {
@@ -1610,7 +1598,7 @@
   DeleteMultipartUpload.prototype.maxRetries = 1;
   DeleteMultipartUpload.prototype.success = function () {
     this.fileUpload.setStatus(ABORTED);
-    return true;
+    this.awsDeferred.resolve(this.currentXhr);
   };
   DeleteMultipartUpload.prototype.errorHandler =  function (reason) {
     if (this.attempts > this.maxRetries) {
@@ -1972,14 +1960,27 @@
     var fileParts = fileName.split('/'),
         encodedParts = [];
     fileParts.forEach(function (p) {
-      encodedParts.push(encodeURIComponent(p).replace(/\(/g, "%28").replace(/\)/g, "%29").replace(/'/g, "%27"));
+      var buf = [],
+          enc = encodeURIComponent(p);
+      for (var i = 0; i < enc.length; i++) {
+        buf.push(S3_EXTRA_ENCODED_CHARS[enc.charCodeAt(i)] || enc.charAt(i));
+      }
+      encodedParts.push(buf.join(""));
     });
     return encodedParts.join('/');
   }
 
   function uri(url) {
-    var p = document.createElement('a');
-    p.href = url || "/";
+    var p,
+        href = url || '/';
+
+    try {
+      p = new URL(href);
+      p.search = p.search || "";
+    } catch (e) {
+      p = document.createElement('a');
+      p.href = href;
+    }
 
     return {
       protocol: p.protocol, // => "http:"
@@ -1999,14 +2000,14 @@
   }
 
   function getAwsResponse(xhr) {
-    var oParser = new DOMParser(),
-        oDOM = oParser.parseFromString(xhr.responseText, "text/html"),
-        code = oDOM.getElementsByTagName("Code"),
-        msg = oDOM.getElementsByTagName("Message");
-    code = code && code.length ? (code[0].innerHTML || code[0].textContent) : '';
-    msg = msg && msg.length ? (msg[0].innerHTML || msg[0].textContent) : '';
-
+    var code = elementText(xhr.responseText, "Code"),
+        msg = elementText(xhr.responseText, "Message");
     return code.length ? ['AWS Code: ', code, ', Message:', msg].join("") : '';
+  }
+
+  function elementText(source, element) {
+    var match = source.match(["<", element, ">(.+)</", element, ">"].join(""));
+    return match ? match[1] : '';
   }
 
   function defer() {
@@ -2032,19 +2033,12 @@
     }
 
     obj1 = obj1 || {};
+    obj2 = obj2 || {};
+    obj3 = obj3 || {};
     ext(obj2, obj3);
     ext(obj1, obj2);
 
     return obj1;
-  }
-
-  function parseXml(body) {
-    var parser = new DOMParser();
-    return parser.parseFromString(body, "text/xml");
-  }
-
-  function nodeValue(parent, nodeName) {
-    return parent.getElementsByTagName(nodeName)[0].textContent;
   }
 
   function getSavedUploads(purge) {
@@ -2112,54 +2106,35 @@
     return [size.toFixed(2).replace('.00', ''), units[i]].join(" ");
   }
 
-  var historyCache = {
-    supported: function () {
-      var result = false;
-      if (typeof window !== 'undefined') {
-        if (!('localStorage' in window)) {
-          return result;
-        }
-      } else {
+  var historyCache;
+  function HistoryCache(mockLocalStorage) {
+    var supported = HistoryCache.supported();
+    this.cacheStore = mockLocalStorage ? {} : (supported ? localStorage : undefined);
+  }
+  HistoryCache.prototype.supported = false;
+  HistoryCache.prototype.cacheStore = undefined;
+  HistoryCache.prototype.getItem = function (key) { if (this.cacheStore) { return this.cacheStore[key]; }};
+  HistoryCache.prototype.setItem = function (key, value) { if (this.cacheStore) { this.cacheStore[key] = value; }};
+  HistoryCache.prototype.removeItem = function (key) { if (this.cacheStore) { return delete this.cacheStore[key] }};
+  HistoryCache.supported = function () {
+    var result = false;
+    if (typeof window !== 'undefined') {
+      if (!('localStorage' in window)) {
         return result;
       }
-
-      // Try to use storage (it might be disabled, e.g. user is in private mode)
-      try {
-        localStorage.setItem('___test', 'OK');
-        var test = localStorage.getItem('___test');
-        localStorage.removeItem('___test');
-
-        result = test === 'OK';
-      } catch (e) {
-        return result;
-      }
-
+    } else {
       return result;
-    },
-    getItem: function (key) {
-      if (this.supported()) {
-        return localStorage.getItem(key)
-      }
-    },
-    setItem: function (key, value) {
-      if (this.supported()) {
-        return localStorage.setItem(key, value);
-      }
-    },
-    clear: function () {
-      if (this.supported()) {
-        return localStorage.clear();
-      }
-    },
-    key: function (key) {
-      if (this.supported()) {
-        return localStorage.key(key);
-      }
-    },
-    removeItem: function (key) {
-      if (this.supported()) {
-        return localStorage.removeItem(key);
-      }
+    }
+
+    // Try to use storage (it might be disabled, e.g. user is in private mode)
+    try {
+      var k = '___test';
+      localStorage[k] = 'OK';
+      var test = localStorage[k];
+      delete localStorage[k];
+      return test === 'OK';
+    } catch (e) {
+      return result;
     }
   };
 

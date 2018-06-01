@@ -22,13 +22,26 @@ app.listen(8080, '127.0.0.1', function () {
 });
 
 app.use('/sign_auth', function (req, res) {
-	// TODO: Do something to authenticate this request
-	var signature = crypto
-		.createHmac('sha1', process.env.AWS_SECRET)
-		.update(req.query.to_sign)
-		.digest('base64')
+  
+  const timestamp = req.query.datetime.substr(0, 8);
+
+  const dateKey = hmac('AWS4' + process.env.AWS_SECRET, timestamp);
+  const dateRegionKey = hmac(dateKey, process.env.AWS_REGION);
+  const dateRegionServiceKey = hmac(dateRegionKey, 's3');
+  const signingKey = hmac(dateRegionServiceKey, 'aws4_request');
+
+  var signature = hmac(signingKey, req.query.to_sign).toString('hex');
+
 	console.log('Created signature "' + signature + '" from ' + req.query.to_sign);
 	res.send(signature);
+  
+  // ===========
+  
+  function hmac(key, string){
+    crypto.createHmac('sha256', key);
+      hmac.end(string);
+      return hmac.read();
+  }
 });
 
 app.get('/index.html', function (req, res) {
